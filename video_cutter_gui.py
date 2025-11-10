@@ -10,7 +10,8 @@ import sys
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtCore import Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -33,6 +34,128 @@ PREVIEW_LOOP_MARGIN_MS = 120
 SESSION_FILE = Path.home() / ".video_cutter_session.json"
 
 
+class RangeSlider(QWidget):
+    """Simple horizontal range slider with two handles (lower/upper)."""
+
+    lowerValueChanged = Signal(int)
+    upperValueChanged = Signal(int)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setMinimumHeight(32)
+        self._min = 0
+        self._max = 100
+        self._lower = 0
+        self._upper = 100
+        self._active_handle: str | None = None
+        self._margin = 12
+
+    def minimum(self) -> int:
+        return self._min
+
+    def maximum(self) -> int:
+        return self._max
+
+    def lowerValue(self) -> int:
+        return self._lower
+
+    def upperValue(self) -> int:
+        return self._upper
+
+    def setRange(self, minimum: int, maximum: int) -> None:
+        if maximum <= minimum:
+            maximum = minimum + 1
+        self._min = minimum
+        self._max = maximum
+        self._lower = max(self._min, min(self._lower, self._max))
+        self._upper = max(self._lower, min(self._upper, self._max))
+        self.update()
+
+    def setLowerValue(self, value: int) -> None:
+        value = max(self._min, min(value, self._upper))
+        if value != self._lower:
+            self._lower = value
+            self.lowerValueChanged.emit(value)
+            self.update()
+
+    def setUpperValue(self, value: int) -> None:
+        value = min(self._max, max(value, self._lower))
+        if value != self._upper:
+            self._upper = value
+            self.upperValueChanged.emit(value)
+            self.update()
+
+    def setValues(self, lower: int, upper: int) -> None:
+        self._lower = max(self._min, min(lower, upper))
+        self._upper = max(self._lower, min(upper, self._max))
+        self.update()
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        groove_y = self.height() // 2
+        groove_start = self._margin
+        groove_end = self.width() - self._margin
+        painter.setPen(QPen(self.palette().mid().color(), 4))
+        painter.drawLine(groove_start, groove_y, groove_end, groove_y)
+
+        lower_x = self._value_to_pos(self._lower)
+        upper_x = self._value_to_pos(self._upper)
+        painter.setPen(QPen(self.palette().highlight().color(), 6))
+        painter.drawLine(lower_x, groove_y, upper_x, groove_y)
+
+        painter.setBrush(self.palette().button().color())
+        painter.setPen(QPen(self.palette().shadow().color(), 1))
+        painter.drawEllipse(lower_x - 8, groove_y - 8, 16, 16)
+        painter.drawEllipse(upper_x - 8, groove_y - 8, 16, 16)
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        pos = event.position().toPoint().x()
+        lower_x = self._value_to_pos(self._lower)
+        upper_x = self._value_to_pos(self._upper)
+        if abs(pos - lower_x) <= abs(pos - upper_x):
+            self._active_handle = "lower"
+        else:
+            self._active_handle = "upper"
+        self._move_handle(pos)
+        event.accept()
+
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
+        if not self._active_handle:
+            return
+        pos = event.position().toPoint().x()
+        self._move_handle(pos)
+        event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        self._active_handle = None
+        super().mouseReleaseEvent(event)
+
+    def _move_handle(self, pos: int) -> None:
+        value = self._pos_to_value(pos)
+        if self._active_handle == "lower":
+            self.setLowerValue(value)
+        elif self._active_handle == "upper":
+            self.setUpperValue(value)
+
+    def _value_to_pos(self, value: int) -> int:
+        if self._max == self._min:
+            return self._margin
+        ratio = (value - self._min) / (self._max - self._min)
+        usable_width = self.width() - 2 * self._margin
+        return int(self._margin + ratio * usable_width)
+
+    def _pos_to_value(self, pos: int) -> int:
+        pos = max(self._margin, min(self.width() - self._margin, pos))
+        usable_width = self.width() - 2 * self._margin
+        if usable_width <= 0:
+            return self._min
+        ratio = (pos - self._margin) / usable_width
+        value = self._min + ratio * (self._max - self._min)
+        return int(round(value))
+
+
 class VideoCutterWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -45,10 +168,12 @@ class VideoCutterWindow(QMainWindow):
         self.start_ms = 0
         self.end_ms = 1000
         self.slider_max_range = 1000
+        self.video_duration_ms = 0
         self.preview_paused = False
         self.slider_dragging = False
         self.pending_preview_restart = False
         self._normalizing_times = False
+        self._updating_range_slider = False
 
         self._build_ui()
         self._setup_player()
@@ -75,6 +200,13 @@ class VideoCutterWindow(QMainWindow):
 
         self.start_edit = self._add_time_input(main_layout, "Inicio (seg o HH:MM:SS):")
         self.end_edit = self._add_time_input(main_layout, "Fin (seg o HH:MM:SS):")
+
+        range_layout = QVBoxLayout()
+        range_layout.addWidget(QLabel("Selecciona el intervalo:"))
+        self.range_slider = RangeSlider()
+        self.range_slider.setEnabled(False)
+        range_layout.addWidget(self.range_slider)
+        main_layout.addLayout(range_layout)
 
         self.video_widget = QVideoWidget()
         self.video_widget.setMinimumHeight(320)
@@ -130,6 +262,9 @@ class VideoCutterWindow(QMainWindow):
         self.preview_slider.sliderReleased.connect(lambda: self._set_slider_dragging(False))
         self.preview_slider.valueChanged.connect(self._on_slider_value_changed)
 
+        self.range_slider.lowerValueChanged.connect(self._on_range_lower_changed)
+        self.range_slider.upperValueChanged.connect(self._on_range_upper_changed)
+
         self.play_button.clicked.connect(self._toggle_playback)
         self.rewind_button.clicked.connect(lambda: self._seek_by_ms(-1000))
         self.forward_button.clicked.connect(lambda: self._seek_by_ms(1000))
@@ -137,10 +272,11 @@ class VideoCutterWindow(QMainWindow):
 
     # ----------------------------------------------------------- File Flow ---
     def select_file(self) -> None:
+        initial_dir = self.last_dir if self.last_dir.exists() else Path.home()
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Selecciona un video",
-            str(self.last_dir) if self.last_dir else "",
+            str(initial_dir),
             "Videos (*.mp4 *.mov *.mkv *.avi *.webm);;Todos los archivos (*.*)",
         )
         if not path:
@@ -160,8 +296,10 @@ class VideoCutterWindow(QMainWindow):
         self.start_edit.setText("00:00:00")
         duration = self._get_cached_duration(video_path)
         if duration is not None:
+            self.video_duration_ms = int(max(1, duration * 1000))
             self.end_edit.setText(format_timestamp(duration))
         else:
+            self.video_duration_ms = max(self.video_duration_ms, 10000)
             self.end_edit.setText("00:00:10")
         self._normalize_times("start")
 
@@ -207,18 +345,53 @@ class VideoCutterWindow(QMainWindow):
         self.end_ms = end_ms
         self.start_edit.setText(format_timestamp(start_ms / 1000))
         self.end_edit.setText(format_timestamp(end_ms / 1000))
-        self._configure_slider()
+        self._configure_range_slider()
+        self._configure_preview_slider()
         self._restart_preview_if_ready()
         if self.file_path:
             self._save_session()
 
+    def _configure_range_slider(self) -> None:
+        if not self.file_path or self.video_duration_ms <= 0:
+            self.range_slider.setEnabled(False)
+            return
+        self.range_slider.setEnabled(True)
+        self._updating_range_slider = True
+        self.range_slider.setRange(0, self.video_duration_ms)
+        self.range_slider.setValues(self.start_ms, self.end_ms)
+        self._updating_range_slider = False
+
     # -------------------------------------------------------------- Slider ---
-    def _configure_slider(self) -> None:
+    def _configure_preview_slider(self) -> None:
         duration = max(1, self.end_ms - self.start_ms)
         self.slider_max_range = duration
         self.preview_slider.setRange(0, duration)
         self.preview_slider.setSingleStep(max(1, duration // 250))
         self.preview_slider.setValue(0)
+
+    def _on_range_lower_changed(self, value: int) -> None:
+        if self._updating_range_slider:
+            return
+        self._apply_range_change(lower=value, upper=self.end_ms)
+
+    def _on_range_upper_changed(self, value: int) -> None:
+        if self._updating_range_slider:
+            return
+        self._apply_range_change(lower=self.start_ms, upper=value)
+
+    def _apply_range_change(self, lower: int, upper: int) -> None:
+        lower = max(0, min(lower, upper - 1))
+        upper = max(lower + 1, min(self.video_duration_ms or upper, upper))
+        self.start_ms = lower
+        self.end_ms = upper
+        self._normalizing_times = True
+        self.start_edit.setText(format_timestamp(lower / 1000))
+        self.end_edit.setText(format_timestamp(upper / 1000))
+        self._normalizing_times = False
+        self._configure_preview_slider()
+        self._restart_preview_if_ready()
+        if self.file_path:
+            self._save_session()
 
     def _set_slider_dragging(self, dragging: bool) -> None:
         self.slider_dragging = dragging
@@ -326,6 +499,7 @@ class VideoCutterWindow(QMainWindow):
             self.play_button,
             self.rewind_button,
             self.forward_button,
+            self.range_slider,
         ):
             widget.setEnabled(enabled)
         self.cut_button.setEnabled(enabled)
@@ -450,10 +624,15 @@ class VideoCutterWindow(QMainWindow):
 
         self.file_path = path
         self.file_edit.setText(str(path))
+        duration = self._get_cached_duration(path)
+        if duration is not None:
+            self.video_duration_ms = int(max(1, duration * 1000))
         if start:
             self.start_edit.setText(start)
         if end:
             self.end_edit.setText(end)
+        if duration is None:
+            self.video_duration_ms = max(self.video_duration_ms, 10000)
         self.player.setSource(QUrl.fromLocalFile(str(path)))
         self.pending_preview_restart = True
         self._update_controls(True)
