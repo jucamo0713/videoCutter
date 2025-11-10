@@ -1,22 +1,22 @@
 # videoCutter
 
-Herramienta de línea de comandos para recortar intervalos de un video usando **ffmpeg**. El proyecto está pensado para ejecutarse con **PyPy 3**, aprovechando su compilación JIT para tener mejor rendimiento en tiempo real.
+Herramienta de línea de comandos y GUI para recortar intervalos de un video usando **ffmpeg**. Ejecuta el proyecto con **Python 3.8+ (CPython)**; PyPy no es compatible debido al uso de PySide6 para la interfaz gráfica.
 
 ## Requisitos
 
-1. Instala PyPy 3 más reciente desde https://www.pypy.org.
+1. Instala Python 3.8+ desde https://www.python.org/downloads/.
 2. Instala ffmpeg y asegúrate de que el comando `ffmpeg` esté disponible en tu `PATH`.
    - Linux: generalmente `sudo apt install ffmpeg`, `sudo pacman -S ffmpeg`, etc.
    - macOS: `brew install ffmpeg`.
    - Windows: descarga desde https://ffmpeg.org/download.html, descomprime y agrega la carpeta `bin` al `PATH`.
-3. Crea un entorno virtual con PyPy:
+3. Crea un entorno virtual con Python 3:
    ```bash
-   pypy3 -m venv .venv
+   python3 -m venv .venv
    source .venv/bin/activate   # En PowerShell: .\.venv\Scripts\Activate.ps1
    ```
-4. Instala las dependencias (solo estándar por ahora):
+4. Instala las dependencias:
    ```bash
-   pypy3 -m pip install -r requirements.txt
+   python -m pip install -r requirements.txt
    ```
 
 ## Uso
@@ -39,19 +39,19 @@ python video_cutter.py demo.mp4 00:00:05 00:00:12 -o demo_clip.mp4
 - Si omites `-o/--output`, el script generará un nombre automáticamente junto al archivo original.
 - El corte intenta copiar los streams (`-c copy`), así que es muy rápido y no re-encodea el video si los codecs lo permiten.
 
-### Interfaz gráfica
+### Interfaz gráfica (PySide6)
 
-También cuentas con una interfaz simple construida con Tkinter que funciona tanto en Windows como en Linux:
+La GUI se ejecuta con PySide6 y ofrece vista previa con controles de reproducción y selección visual del intervalo:
 
 ```bash
 python video_cutter_gui.py
 ```
 
-La ventana te permitirá:
+Características:
 
-- Seleccionar el archivo de video mediante un diálogo del sistema.
-- Ingresar el tiempo de inicio y final en los mismos formatos aceptados por la CLI.
-- Ejecutar el recorte; el resultado se guardará junto al archivo original con un nombre generado automáticamente.
+- Selector de archivo con recordatorio de la última sesión.
+- Slider doble para marcar inicio y fin, con miniaturas en vivo al arrastrar.
+- Reproductor embebido (audio + video) con loop del intervalo antes de cortar.
 
 ## Próximos pasos
 
