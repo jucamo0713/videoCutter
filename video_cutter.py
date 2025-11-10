@@ -64,13 +64,61 @@ def build_output_path(input_path: Path, suffix: str) -> Path:
 
 
 def ensure_ffmpeg_available() -> str:
+    """
+    Locate ffmpeg, preferring an embedded binary bundled with the app, then PATH.
+
+    Search order (Windows):
+      - Next to the executable (ffmpeg.exe)
+      - In a sibling folder: ffmpeg/bin/ffmpeg.exe
+      - PyInstaller onefile temp dir (sys._MEIPASS)
+      - Project-relative vendors/ffmpeg/bin/ffmpeg.exe (for dev runs)
+      - PATH
+
+    On non-Windows, the same without the .exe suffix.
+    """
+    is_windows = sys.platform.startswith("win")
+    exe_name = "ffmpeg.exe" if is_windows else "ffmpeg"
+
+    candidates: list[Path] = []
+
+    # When frozen (PyInstaller), prefer paths relative to the executable
+    try:
+        exe_dir = Path(sys.executable).resolve().parent
+        candidates.append(exe_dir / exe_name)
+        candidates.append(exe_dir / "ffmpeg" / "bin" / exe_name)
+    except Exception:
+        pass
+
+    # PyInstaller onefile extraction directory
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        meipass_path = Path(meipass)
+        candidates.append(meipass_path / exe_name)
+        candidates.append(meipass_path / "ffmpeg" / "bin" / exe_name)
+
+    # Project-relative vendors for dev runs
+    try:
+        here = Path(__file__).resolve().parent
+        candidates.append(here / exe_name)
+        candidates.append(here / "ffmpeg" / "bin" / exe_name)
+        candidates.append(here / "vendors" / "ffmpeg" / "bin" / exe_name)
+        candidates.append(here.parent / "vendors" / "ffmpeg" / "bin" / exe_name)
+    except Exception:
+        pass
+
+    for path in candidates:
+        if path.is_file():
+            return str(path)
+
+    # Fallback to PATH
     ffmpeg_path = shutil.which("ffmpeg")
-    if not ffmpeg_path:
-        raise RuntimeError(
-            "ffmpeg no está instalado o no se encuentra en PATH. "
-            "Instálalo desde https://ffmpeg.org/download.html y vuelve a intentarlo."
-        )
-    return ffmpeg_path
+    if ffmpeg_path:
+        return ffmpeg_path
+
+    raise RuntimeError(
+        "No se encontró ffmpeg. Coloca ffmpeg junto al ejecutable o "
+        "instálalo y añádelo al PATH. Descargas: https://ffmpeg.org/download.html"
+    )
 
 
 def build_command(
