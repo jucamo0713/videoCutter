@@ -3,6 +3,113 @@
 
 from __future__ import annotations
 
+# Windows-specific bootstrap: ensure Qt multimedia backends (FFmpeg/WMF) can load.
+# Must run BEFORE importing QtMultimedia modules.
+import os
+import sys
+try:
+    if sys.platform.startswith("win"):
+        import PySide6  # used to locate package resources
+        from PySide6.QtCore import QCoreApplication, QLibraryInfo
+
+        base_dir = os.path.dirname(PySide6.__file__)
+        qt_bin = os.path.join(base_dir, "Qt6", "bin")
+        plugins_dirs = [
+            os.path.join(base_dir, "plugins"),
+            os.path.join(base_dir, "Qt6", "plugins"),
+        ]
+
+        # Ensure dependent Qt/FFmpeg DLLs are discoverable by the loader
+        # PySide6 wheels may place DLLs directly under base_dir and/or under Qt6/bin
+        if hasattr(os, "add_dll_directory"):
+            os.add_dll_directory(base_dir)
+            if os.path.isdir(qt_bin):
+                os.add_dll_directory(qt_bin)
+        else:
+            os.environ["PATH"] = os.environ.get("PATH", "") + os.pathsep + base_dir
+            if os.path.isdir(qt_bin):
+                os.environ["PATH"] += os.pathsep + qt_bin
+
+        # Ensure Qt sees the packaged plugins directories (multimedia/wmf/ffmpeg)
+        for p in plugins_dirs:
+            if os.path.isdir(p):
+                QCoreApplication.addLibraryPath(p)
+                if hasattr(os, "add_dll_directory"):
+                    os.add_dll_directory(p)
+
+        # Also set QT_PLUGIN_PATH so the plugin loader sees both roots early
+        existing = os.environ.get("QT_PLUGIN_PATH", "")
+        paths = os.pathsep.join([p for p in plugins_dirs if os.path.isdir(p)])
+        os.environ["QT_PLUGIN_PATH"] = paths + (os.pathsep + existing if existing else "")
+
+        # Backend/platform selection with optional overrides via env
+        forced_backend = os.environ.get("VIDEO_CUTTER_FORCE_BACKEND")
+        backend = forced_backend or os.environ.get("QT_MEDIA_BACKEND") or "ffmpeg"
+        os.environ["QT_MEDIA_BACKEND"] = backend
+
+        forced_platform = os.environ.get("VIDEO_CUTTER_FORCE_PLATFORM")
+        platform = forced_platform or os.environ.get("QT_QPA_PLATFORM") or "windows"
+        os.environ["QT_QPA_PLATFORM"] = platform
+
+        # Optional diagnostics to help troubleshoot plugin loading
+        if os.environ.get("VIDEO_CUTTER_DEBUG", "0") == "1":
+            try:
+                print("[VideoCutter][Win] PySide6 base:", base_dir)
+                print(
+                    "[VideoCutter][Win] Qt bin:",
+                    qt_bin,
+                    "(exists=",
+                    os.path.isdir(qt_bin),
+                    ")",
+                )
+                print("[VideoCutter][Win] QT_PLUGIN_PATH:", os.environ.get("QT_PLUGIN_PATH", ""))
+                print(
+                    "[VideoCutter][Win] QLibraryInfo.PluginsPath:",
+                    QLibraryInfo.path(QLibraryInfo.LibraryPath.PluginsPath),
+                )
+                try:
+                    paths_list = QCoreApplication.libraryPaths()
+                except Exception:
+                    paths_list = []
+                print(
+                    "[VideoCutter][Win] QCoreApplication.libraryPaths:",
+                    "; ".join(paths_list),
+                )
+                # Check for multimedia plugins existence and try loading
+                from PySide6.QtCore import QPluginLoader
+
+                candidates = []
+                for root in plugins_dirs:
+                    mm = os.path.join(root, "multimedia")
+                    candidates.append(os.path.join(mm, "ffmpegmediaplugin.dll"))
+                    candidates.append(os.path.join(mm, "windowsmediaplugin.dll"))
+                    candidates.append(os.path.join(mm, "wmfmediaplugin.dll"))
+
+                for cand in candidates:
+                    if not cand:
+                        continue
+                    print(f"[VideoCutter][Win] Check {cand}:", os.path.exists(cand))
+                # Attempt load of first existing candidate to report detailed error
+                for cand in candidates:
+                    if os.path.exists(cand):
+                        loader = QPluginLoader(cand)
+                        ok = loader.load()
+                        print(
+                            f"[VideoCutter][Win] QPluginLoader.load({os.path.basename(cand)}):",
+                            ok,
+                        )
+                        if not ok:
+                            print(
+                                "[VideoCutter][Win] QPluginLoader.errorString:",
+                                loader.errorString(),
+                            )
+                        break
+            except Exception as _dbg_exc:
+                print("[VideoCutter][Win] Debug info error:", _dbg_exc)
+except Exception:
+    # Best-effort: do not block startup if environment tweaks fail
+    pass
+
 import json
 import shutil
 import subprocess
@@ -799,7 +906,20 @@ class VideoCutterWindow(QMainWindow):
 
 
 def main() -> None:
+    # Force platform via argv too, to override any external env
+    try:
+        if sys.platform.startswith("win") and "-platform" not in sys.argv:
+            sys.argv = [sys.argv[0], "-platform", os.environ.get("QT_QPA_PLATFORM", "windows"), *sys.argv[1:]]
+    except Exception:
+        pass
+
     app = QApplication(sys.argv)
+    if os.environ.get("VIDEO_CUTTER_DEBUG", "0") == "1":
+        try:
+            from PySide6.QtGui import QGuiApplication
+            print("[VideoCutter] Active platform:", QGuiApplication.platformName())
+        except Exception as _ex:
+            print("[VideoCutter] Could not get platform name:", _ex)
     window = VideoCutterWindow()
     window.show()
     sys.exit(app.exec())
