@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import sys
@@ -29,6 +30,7 @@ from PySide6.QtWidgets import (
 from video_cutter import cut_video, format_timestamp, parse_timestamp
 
 PREVIEW_LOOP_MARGIN_MS = 120
+SESSION_FILE = Path.home() / ".video_cutter_session.json"
 
 
 class VideoCutterWindow(QMainWindow):
@@ -38,6 +40,7 @@ class VideoCutterWindow(QMainWindow):
         self.resize(960, 640)
 
         self.file_path: Path | None = None
+        self.last_dir: Path = Path.home()
         self.duration_cache: dict[Path, float | None] = {}
         self.start_ms = 0
         self.end_ms = 1000
@@ -51,6 +54,7 @@ class VideoCutterWindow(QMainWindow):
         self._setup_player()
         self._connect_ui()
         self._update_controls(False)
+        self._load_session()
 
     # ------------------------------------------------------------------ UI ---
     def _build_ui(self) -> None:
@@ -136,19 +140,21 @@ class VideoCutterWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Selecciona un video",
-            str(self.file_path.parent) if self.file_path else "",
+            str(self.last_dir) if self.last_dir else "",
             "Videos (*.mp4 *.mov *.mkv *.avi *.webm);;Todos los archivos (*.*)",
         )
         if not path:
             return
         video_path = Path(path)
         self.file_path = video_path
+        self.last_dir = video_path.parent
         self.file_edit.setText(str(video_path))
         self.status_label.setText("Cargando vista previa…")
         self._populate_default_times(video_path)
         self.player.setSource(QUrl.fromLocalFile(str(video_path)))
         self.pending_preview_restart = True
         self._update_controls(True)
+        self._save_session()
 
     def _populate_default_times(self, video_path: Path) -> None:
         self.start_edit.setText("00:00:00")
@@ -203,6 +209,8 @@ class VideoCutterWindow(QMainWindow):
         self.end_edit.setText(format_timestamp(end_ms / 1000))
         self._configure_slider()
         self._restart_preview_if_ready()
+        if self.file_path:
+            self._save_session()
 
     # -------------------------------------------------------------- Slider ---
     def _configure_slider(self) -> None:
@@ -366,6 +374,7 @@ class VideoCutterWindow(QMainWindow):
         self.cut_button.setEnabled(True)
         self.status_label.setText(f"Recorte listo: {path}")
         QMessageBox.information(self, "Recorte listo", f"Video generado en:\n{path}")
+        self._save_session()
 
     def _on_cut_failed(self, message: str) -> None:
         self.cut_button.setEnabled(True)
@@ -412,7 +421,56 @@ class VideoCutterWindow(QMainWindow):
 
     def closeEvent(self, event):  # type: ignore[override]
         self.player.stop()
+        self._save_session()
         super().closeEvent(event)
+
+    # -------------------------------------------------------- Session I/O ---
+    def _load_session(self) -> None:
+        if not SESSION_FILE.exists():
+            return
+        try:
+            data = json.loads(SESSION_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            return
+
+        last_dir = data.get("last_dir")
+        if last_dir:
+            self.last_dir = Path(last_dir)
+
+        file_str = data.get("file")
+        start = data.get("start")
+        end = data.get("end")
+        if not file_str:
+            return
+
+        path = Path(file_str)
+        self.last_dir = path.parent
+        if not path.exists():
+            return
+
+        self.file_path = path
+        self.file_edit.setText(str(path))
+        if start:
+            self.start_edit.setText(start)
+        if end:
+            self.end_edit.setText(end)
+        self.player.setSource(QUrl.fromLocalFile(str(path)))
+        self.pending_preview_restart = True
+        self._update_controls(True)
+        self._normalize_times("start")
+        self.status_label.setText("Vista previa lista.")
+
+    def _save_session(self) -> None:
+        data = {
+            "file": str(self.file_path) if self.file_path else "",
+            "start": self.start_edit.text().strip(),
+            "end": self.end_edit.text().strip(),
+            "last_dir": str(self.last_dir) if self.last_dir else "",
+        }
+        try:
+            SESSION_FILE.write_text(json.dumps(data))
+        except OSError:
+            pass
 
 
 def main() -> None:
