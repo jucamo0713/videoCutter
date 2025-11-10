@@ -10,9 +10,9 @@ import sys
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QPainter, QPen
-from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PySide6.QtCore import Qt, QTimer, QUrl, QPoint, Signal
+from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
+from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QApplication,
@@ -39,6 +39,9 @@ class RangeSlider(QWidget):
 
     lowerValueChanged = Signal(int)
     upperValueChanged = Signal(int)
+    handleDragStarted = Signal(str)
+    handleDragMoved = Signal(str, int)
+    handleDragFinished = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -118,6 +121,8 @@ class RangeSlider(QWidget):
             self._active_handle = "lower"
         else:
             self._active_handle = "upper"
+        if self._active_handle:
+            self.handleDragStarted.emit(self._active_handle)
         self._move_handle(pos)
         event.accept()
 
@@ -129,6 +134,8 @@ class RangeSlider(QWidget):
         event.accept()
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        if self._active_handle:
+            self.handleDragFinished.emit(self._active_handle)
         self._active_handle = None
         super().mouseReleaseEvent(event)
 
@@ -136,8 +143,10 @@ class RangeSlider(QWidget):
         value = self._pos_to_value(pos)
         if self._active_handle == "lower":
             self.setLowerValue(value)
+            self.handleDragMoved.emit("lower", self._lower)
         elif self._active_handle == "upper":
             self.setUpperValue(value)
+            self.handleDragMoved.emit("upper", self._upper)
 
     def _value_to_pos(self, value: int) -> int:
         if self._max == self._min:
@@ -154,6 +163,40 @@ class RangeSlider(QWidget):
         ratio = (pos - self._margin) / usable_width
         value = self._min + ratio * (self._max - self._min)
         return int(round(value))
+
+    def handle_position(self, handle: str) -> int:
+        if handle == "lower":
+            return self._value_to_pos(self._lower)
+        return self._value_to_pos(self._upper)
+
+
+class ThumbnailPopup(QWidget):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent, Qt.ToolTip)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setWindowFlag(Qt.FramelessWindowHint)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
+        self.image_label = QLabel(alignment=Qt.AlignCenter)
+        self.image_label.setFixedSize(160, 90)
+        self.time_label = QLabel(alignment=Qt.AlignCenter)
+        layout.addWidget(self.image_label)
+        layout.addWidget(self.time_label)
+        self.update_thumbnail(None)
+
+    def update_thumbnail(self, pixmap: QPixmap | None) -> None:
+        if pixmap:
+            scaled = pixmap.scaled(
+                self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
+            self.image_label.setPixmap(scaled)
+        else:
+            self.image_label.setPixmap(QPixmap())
+            self.image_label.setText("Cargando…")
+
+    def update_time(self, text: str) -> None:
+        self.time_label.setText(text)
 
 
 class VideoCutterWindow(QMainWindow):
@@ -174,6 +217,12 @@ class VideoCutterWindow(QMainWindow):
         self.pending_preview_restart = False
         self._normalizing_times = False
         self._updating_range_slider = False
+        self._active_range_handle: str | None = None
+        self._thumbnail_handle: str | None = None
+        self._thumbnail_global_point: QPoint | None = None
+
+        self.thumbnail_popup = ThumbnailPopup(self)
+        self.thumbnail_popup.hide()
 
         self._build_ui()
         self._setup_player()
@@ -254,6 +303,15 @@ class VideoCutterWindow(QMainWindow):
         self.player.mediaStatusChanged.connect(self._on_media_status_changed)
         self.player.errorOccurred.connect(self._on_media_error)
 
+        self.thumb_player = QMediaPlayer(self)
+        self.thumb_audio = QAudioOutput(self)
+        self.thumb_audio.setVolume(0)
+        self.thumb_player.setAudioOutput(self.thumb_audio)
+        self.thumb_sink = QVideoSink(self)
+        self.thumb_player.setVideoSink(self.thumb_sink)
+        self.thumb_sink.videoFrameChanged.connect(self._on_thumbnail_frame)
+        self.thumb_requested_position: int | None = None
+
     def _connect_ui(self) -> None:
         self.start_edit.editingFinished.connect(lambda: self._on_time_input("start"))
         self.end_edit.editingFinished.connect(lambda: self._on_time_input("end"))
@@ -264,6 +322,9 @@ class VideoCutterWindow(QMainWindow):
 
         self.range_slider.lowerValueChanged.connect(self._on_range_lower_changed)
         self.range_slider.upperValueChanged.connect(self._on_range_upper_changed)
+        self.range_slider.handleDragStarted.connect(self._on_range_drag_started)
+        self.range_slider.handleDragMoved.connect(self._on_range_drag_moved)
+        self.range_slider.handleDragFinished.connect(self._on_range_drag_finished)
 
         self.play_button.clicked.connect(self._toggle_playback)
         self.rewind_button.clicked.connect(lambda: self._seek_by_ms(-1000))
@@ -393,6 +454,59 @@ class VideoCutterWindow(QMainWindow):
         if self.file_path:
             self._save_session()
 
+    def _on_range_drag_started(self, handle: str) -> None:
+        if not self.file_path:
+            return
+        self._active_range_handle = handle
+        if not self.preview_paused and not self.slider_dragging:
+            self.player.pause()
+            self._resume_after_drag = True
+        else:
+            self._resume_after_drag = False
+        self.thumbnail_popup.show()
+        self.thumbnail_popup.raise_()
+        self._update_thumbnail_preview(handle)
+
+    def _on_range_drag_moved(self, handle: str, value: int) -> None:
+        if not self.file_path:
+            return
+        if not self._updating_range_slider:
+            self._apply_range_change(
+                lower=value if handle == "lower" else self.start_ms,
+                upper=value if handle == "upper" else self.end_ms,
+            )
+        self._update_thumbnail_preview(handle)
+
+    def _on_range_drag_finished(self, _handle: str) -> None:
+        self._active_range_handle = None
+        self._thumbnail_global_point = None
+        self.thumbnail_popup.hide()
+        if getattr(self, "_resume_after_drag", False) and not self.preview_paused:
+            self.player.play()
+
+    def _update_thumbnail_preview(self, handle: str) -> None:
+        self._thumbnail_handle = handle
+        target = self.start_ms if handle == "lower" else self.end_ms
+        target = max(0, min(target, self.video_duration_ms))
+        self.thumbnail_popup.update_time(format_timestamp(target / 1000))
+        self._position_thumbnail_popup(handle)
+        self._request_thumbnail(target)
+
+    def _position_thumbnail_popup(self, handle: str | None) -> None:
+        if handle:
+            self._thumbnail_handle = handle
+            x = self.range_slider.handle_position(handle)
+            self._thumbnail_global_point = self.range_slider.mapToGlobal(QPoint(x, 0))
+        global_point = self._thumbnail_global_point
+        if global_point is None:
+            return
+        popup = self.thumbnail_popup
+        popup.adjustSize()
+        popup_x = int(global_point.x() - popup.width() / 2)
+        popup_y = global_point.y() - popup.height() - 16
+        popup.move(popup_x, popup_y)
+
+
     def _set_slider_dragging(self, dragging: bool) -> None:
         self.slider_dragging = dragging
         if not dragging:
@@ -482,6 +596,8 @@ class VideoCutterWindow(QMainWindow):
     def _restart_preview(self, auto_play: bool) -> None:
         self.player.setPosition(self.start_ms)
         self.preview_slider.setValue(0)
+        if self.file_path:
+            self.thumb_player.setSource(QUrl.fromLocalFile(str(self.file_path)))
         if auto_play:
             self.preview_paused = False
             self.play_button.setText("Pausar")
@@ -503,6 +619,12 @@ class VideoCutterWindow(QMainWindow):
         ):
             widget.setEnabled(enabled)
         self.cut_button.setEnabled(enabled)
+        if not enabled:
+            self.thumbnail_popup.hide()
+            self._thumbnail_handle = None
+            self._thumbnail_global_point = None
+        if not enabled:
+            self.thumbnail_popup.hide()
 
     # ------------------------------------------------------------ Cutting ---
     def on_cut_click(self) -> None:
@@ -595,8 +717,32 @@ class VideoCutterWindow(QMainWindow):
 
     def closeEvent(self, event):  # type: ignore[override]
         self.player.stop()
+        self.thumb_player.stop()
         self._save_session()
         super().closeEvent(event)
+
+    # ------------------------------------------------------ Thumbnail Flow ---
+    def _request_thumbnail(self, target_ms: int) -> None:
+        if not self.file_path:
+            return
+        if self.thumb_player.source().isEmpty():
+            self.thumb_player.setSource(QUrl.fromLocalFile(str(self.file_path)))
+        self.thumb_player.pause()
+        self.thumb_requested_position = target_ms
+        self.thumb_player.setPosition(target_ms)
+
+    def _on_thumbnail_frame(self, frame) -> None:
+        if self.thumb_requested_position is None or not frame.isValid():
+            return
+        try:
+            image = frame.toImage()
+        except RuntimeError:
+            return
+        if image.isNull():
+            return
+        pixmap = QPixmap.fromImage(image)
+        self.thumbnail_popup.update_thumbnail(pixmap)
+        self._position_thumbnail_popup(None)
 
     # -------------------------------------------------------- Session I/O ---
     def _load_session(self) -> None:
